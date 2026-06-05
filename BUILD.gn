@@ -1,0 +1,23 @@
+# src/ngm/BUILD.gn
+
+import("../webrtc.gni")
+
+group("ngm") {
+  testonly = true
+  deps = [
+    ":room_server",
+  ]
+}
+
+rtc_executable("room_server") {
+  testonly = true
+  sources = [
+    "room_server/main.cc",
+  ]
+  deps = [
+    "//third_party/abseil-cpp/absl/flags:flag",
+    "//third_party/abseil-cpp/absl/flags:parse",
+    "//third_party/abseil-cpp/absl/flags:usage",
+  ]
+}
+

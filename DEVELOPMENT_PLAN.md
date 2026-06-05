@@ -13,20 +13,92 @@
 
 - [ ] 搭建项目骨架（目录结构 + BUILD.gn）
 - [ ] 实现 Room 数据结构（room.h/cc）— 管理房间内的 peer 列表、角色分配（initiator/joiner）
-- [ ] 实现 HTTP 信令接口
-  - `GET /sign_in?room=<roomId>&name=<peerName>` — 加入房间
-  - `GET /sign_out?room=<roomId>&peer_id=<id>` — 离开房间
-  - `POST /message?room=<roomId>&peer_id=<from>&to=<to>` — 发送信令消息
-  - `GET /wait?room=<roomId>&peer_id=<id>` — 长轮询等待消息
+- [ ] 实现 HTTP 信令接口（RESTful path 风格，对齐 AppRTCMobile）
+  - `POST /join/<roomId>` — 加入房间，Body 携带 `{"name":"<peerName>"}`，返回 clientId、房间状态、是否 initiator
+  - `POST /message/<roomId>/<clientId>` — 发送信令消息（SDP/ICE JSON），Server 转发给房间内对端
+  - `POST /leave/<roomId>/<clientId>` — 离开房间
+- [ ] 实现 WebSocket 消息通道（对齐 AppRTCMobile，替代长轮询）
+  - `GET /ws/<roomId>/<clientId>` — WebSocket 升级握手，建立持久双向连接
+  - 握手后通过 WebSocket 帧双向推送信令消息（SDP/ICE/peer 状态变化）
 - [ ] 实现 peer 发现机制 — 新 peer 加入时通知房间内已有成员
 - [ ] 实现角色自动分配 — 第一个进入为 initiator，后续为 joiner
 - [ ] 单元测试 & 手动联调验证
 
+### 实现细节：文件与职责
+
+| 文件 | 职责 |
+|------|------|
+| `server_socket.h/cc` | 基础 Socket 封装（已有），增加连接状态和发送接口 |
+| `http_parser.h/cc` | HTTP 请求解析（Method、Path segments、Headers、Body） |
+| `websocket_handler.h/cc` | WebSocket 握手（RFC 6455）+ 帧编解码 |
+| `room.h/cc` | Room 数据结构（peer 列表、消息路由、角色分配） |
+| `main.cc` | epoll 事件循环、请求分发 |
+
+### 实现细节：WebSocket 协议要点
+
+**握手流程**：
+1. 客户端发送 `GET /ws/<roomId>/<clientId>` 并带 `Upgrade: websocket` + `Sec-WebSocket-Key` 头
+2. Server 取 Key 拼接 magic string `258EAFA5-E914-47DA-95CA-5AB964C80A5`
+3. SHA-1 哈希 → Base64 编码 → 作为 `Sec-WebSocket-Accept` 返回
+4. 返回 `HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: <hash>\r\n\r\n`
+
+**帧格式（接收）**：
+```
+ 0               1               2               3
+ 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7 0 1 2 3 4 5 6 7
++-+-+-+-+-------+-+-------------+-------------------------------+
+|F|R|R|R| opcode|M| Payload len |    Extended payload length    |
+|I|S|S|S|  (4)  |A|     (7)     |             (16/64)           |
+|N|V|V|V|       |S|             |   (if payload len==126/127)   |
+| |1|2|3|       |K|             |                               |
++-+-+-+-+-------+-+-------------+-------------------------------+
+|     Masking-key (0 or 4 bytes)                                |
++-------------------------------+-------------------------------+
+|     Payload Data                                              |
++---------------------------------------------------------------+
+```
+- Client→Server 必须 masked（MASK=1，4 字节 masking key）
+- Server→Client 不 mask
+- 关键 opcode：Text(0x1)、Binary(0x2)、Close(0x8)、Ping(0x9)、Pong(0xA)
+
+**连接状态机**：
+```
+ServerDataSocket 状态：
+  HTTP_PENDING  → 正在接收 HTTP 头
+  HTTP_READY    → HTTP 请求解析完毕（普通 REST 请求，处理后断开）
+  WEBSOCKET     → 已完成升级握手，后续按帧协议收发
+```
+
+**依赖（WebRTC 内已有，无需外部库）**：
+- SHA-1：`rtc_base/message_digest.h` → `rtc::ComputeDigest("sha-1", ...)`
+- Base64：`rtc_base/third_party/base64/base64.h`
+
+### 实现细节：请求交互时序
+
+```
+iOS 客户端                          Room Server
+    |                                    |
+    |-- POST /join/<roomId> ------------>|  (HTTP 请求)
+    |<-- 200 {clientId, isInitiator} ----|  (HTTP 响应，断开)
+    |                                    |
+    |-- GET /ws/<roomId>/<clientId> ---->|  (WebSocket 升级)
+    |   Upgrade: websocket               |
+    |   Sec-WebSocket-Key: xxx           |
+    |<-- 101 Switching Protocols --------|  (升级成功，连接保持)
+    |                                    |
+    |<=== {"type":"offer","sdp":"..."} =>|  (WebSocket 帧，双向)
+    |<=== {"type":"candidate",...} =====>|
+    |                                    |
+    |-- POST /leave/<roomId>/<cid> ----->|  (或发送 Close 帧)
+    |<-- 200 OK -------------------------|
+```
+
 ### 技术选型
 
 - 语言：C++
-- 网络：基于 WebRTC rtc_base 的 Socket 封装
+- 网络：原生 socket + epoll（已实现），不依赖 rtc_base 网络层
 - 构建：GN（集成在 WebRTC 源码树内）
+- 依赖：仅使用 WebRTC 的 SHA-1/Base64 工具函数和 rtc_base/logging
 
 ---
 
