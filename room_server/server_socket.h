@@ -2,6 +2,7 @@
 #define NGM_ROOM_SERVER_SERVER_SOCKET_H_
 
 #include <memory>
+#include <string>
 
 typedef int SocketFd;
 
@@ -30,8 +31,33 @@ class ServerSocketBase {
 
 class ServerDataSocket : public ServerSocketBase {
  public:
+  enum class RequestMethod {
+    INVALID,
+    GET,
+    POST,
+    OPTIONS,
+  };
   explicit ServerDataSocket(SocketFd socket) : ServerSocketBase(socket) {}
+  bool headers_received() const { return method_ != RequestMethod::INVALID; }
+  bool request_received() const {
+    return headers_received() && data_.length() >= content_length_;
+  }
+  bool upgrade_received() const {
+    return method_ == RequestMethod::GET &&
+           header_.find("Upgrade: websocket") != std::string::npos;
+  }
   bool onDataAvailable(bool& close_socket);
+  bool ParseHeaders();
+  bool ParseMethodAndPath(const char* begin, size_t len);
+  bool ParseContentLengthAndType(const char* headers, size_t length);
+
+ protected:
+  RequestMethod method_{};
+  std::string data_{};
+  std::string header_{};
+  std::string path_{};
+  size_t content_length_{};
+  std::string content_type_{};
 };
 
 class ServerListenerSocket : public ServerSocketBase {

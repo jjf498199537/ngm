@@ -4,12 +4,14 @@
 #include <algorithm>
 #include <cstdio>
 #include <vector>
+#include <unordered_map>
 
 #include "absl/flags/flag.h"
 #include "absl/flags/parse.h"
 #include "absl/flags/usage.h"
 #include "rtc_base/logging.h"
 #include "server_socket.h"
+#include "peer_room.h"
 
 ABSL_FLAG(int, port, 8888, "The port on which the server listens.");
 using SocketArray = std::vector<std::unique_ptr<ServerDataSocket>>;
@@ -45,31 +47,36 @@ int main(int argc, char* argv[]) {
 
   struct epoll_event listen_event = {};
   listen_event.events = EPOLLIN;
-  listen_event.data.ptr = &listener;
+  listen_event.data.fd = listener.socket();
   epoll_ctl(epoll_fd,EPOLL_CTL_ADD,listener.socket(),&listen_event);
 
   const int kMaxEvents = 64;
   struct epoll_event events[kMaxEvents];
 
   bool quit = false;
-  SocketArray sockets;
+  std::unordered_map<SocketFd, std::unique_ptr<ServerDataSocket>> pending_connections;
+  std::unordered_map<SocketFd, std::unique_ptr<RoomMember>> room_members;
   while (!quit) {
     int num_events = epoll_wait(epoll_fd,events,kMaxEvents,100);
 
     for (int i = 0; i < num_events; i++) {
-      if (events[i].data.ptr == &listener) {
+      SocketFd received_fd = events[i].data.fd;
+      if (received_fd == listener.socket()) {
         auto client = listener.Accept();
         if (client) {
           struct epoll_event client_event = {};
           client_event.events = EPOLLIN;
-          client_event.data.ptr = client.get();
+          client_event.data.fd = client->socket();
           epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client->socket(), &client_event);
-          sockets.push_back(std::move(client));
+          pending_connections[client->socket()] = std::move(client);
         }
-      } else {
-        bool 
-        auto* client = static_cast<ServerDataSocket*>(events[i].data.ptr);
-        client
+      } else if (auto it = pending_connections.find(received_fd); it != pending_connections.end()) {
+        bool socket_done = false;
+        auto& client = it->second;
+        if (client->onDataAvailable(socket_done) && client->request_received()) {
+
+        }
+        }
       }
     }
   }

@@ -7,6 +7,9 @@
 #include "rtc_base/checks.h"
 #include "rtc_base/logging.h"
 
+constexpr char kHeaderTerminator[] = "\r\n\r\n";
+constexpr int kHeaderTerminatorLength = sizeof(kHeaderTerminator) - 1;
+
 ServerSocketBase::~ServerSocketBase() {
   Close();
 }
@@ -36,6 +39,117 @@ bool ServerDataSocket::onDataAvailable(bool& close_socket) {
     close_socket = true;
     return false;
   }
+  close_socket = false;
+
+  bool ret = true;
+  if (headers_received()) {
+    if (method_ != RequestMethod::POST) {
+      ret = false;
+    } else {
+      data_.append(buffer, bytes);
+    }
+  } else {
+    header_.append(buffer, bytes);
+    size_t found = header_.find(kHeaderTerminator);
+    if (found != std::string::npos) {
+      data_ = header_.substr(found + kHeaderTerminatorLength);
+      header_.resize(found + kHeaderTerminatorLength);
+      ret = ParseHeaders();
+    }
+  }
+
+  return ret;
+}
+
+bool ServerDataSocket::ParseContentLengthAndType(const char* headers,
+                                                 size_t length) {
+  RTC_DCHECK_EQ(content_length_, 0);
+  RTC_DCHECK(content_type_.empty());
+
+  const char* end = headers + length;
+  while (headers && headers < end) {
+    static constexpr absl::string_view kContentLength = "Content-Length:";
+    static constexpr absl::string_view kContentType = "Content-Type:";
+    if (absl::string_view(headers, end - headers)
+            .starts_with((kContentLength))) {
+      headers += kContentLength.size();
+      while (headers[0] == ' ')
+        ++headers;
+      content_length_ = atoi(headers);
+    } else if (absl::string_view(headers, end - headers)
+                   .starts_with(kContentType)) {
+      headers += kContentType.size();
+      while (headers[0] == ' ')
+        ++headers;
+      const char* type_end = strstr(headers, "\r\n");
+      if (type_end == nullptr)
+        type_end = end;
+      content_type_.assign(headers, type_end);
+    } else {
+      ++headers;
+    }
+    headers = strstr(headers, "\r\n");
+    if (headers)
+      headers += 2;
+  }
+  return !content_type_.empty() && content_length_ != 0;
+}
+
+bool ServerDataSocket::ParseHeaders() {
+  RTC_DCHECK(!header_.empty());
+  RTC_DCHECK_EQ(method_, RequestMethod::INVALID);
+
+  size_t i = header_.find("\r\n");
+  if (i == std::string::npos)
+    return false;
+
+  if (!ParseMethodAndPath(header_.data(), i))
+    return false;
+
+  if (method_ == RequestMethod::POST) {
+    const char* headers = header_.data() + i + 2;
+    size_t len = header_.length() - i - 2;
+    if (!ParseContentLengthAndType(headers, len))
+      return false;
+  }
+  return true;
+}
+
+bool ServerDataSocket::ParseMethodAndPath(const char* begin, size_t len) {
+  struct {
+    const char* method_name;
+    size_t method_name_len;
+    RequestMethod id;
+  } supported_methods[] = {
+      {.method_name = "GET", .method_name_len = 3, .id = RequestMethod::GET},
+      {.method_name = "POST", .method_name_len = 4, .id = RequestMethod::POST},
+      //{.method_name = "OPTIONS", .method_name_len = 7, .id =
+      // RequestMethod::OPTIONS},
+  };
+
+  const char* path = nullptr;
+  for (const auto& method : supported_methods) {
+    if (len > method.method_name_len &&
+        isspace(begin[method.method_name_len]) &&
+        strncmp(begin, method.method_name, method.method_name_len) == 0) {
+      method_ = method.id;
+      path = begin + method.method_name_len;
+      break;
+    }
+  }
+
+  const char* end = begin + len;
+  if (!path || path >= end)
+    return false;
+
+  ++path;
+  begin = path;
+  while (!isspace(*path) && path < end)
+    ++path;
+
+  path_.assign(begin, path - begin);
+
+  return true;
 }
 
 bool ServerListenerSocket::Listen(int port) {
