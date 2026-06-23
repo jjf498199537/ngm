@@ -17,8 +17,6 @@ class PeerRoom {
  public:
   PeerRoom() {}
   ~PeerRoom();
-  bool AddMember(std::unique_ptr<ServerDataSocket>)
- protected:
-
-}
+  bool AddMember(std::unique_ptr<ServerDataSocket>);
+};
 #endif

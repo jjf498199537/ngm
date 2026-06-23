@@ -13,11 +13,21 @@ rtc_executable("room_server") {
   testonly = true
   sources = [
     "room_server/main.cc",
+    "room_server/peer_room.cc",
+    "room_server/peer_room.h",
+    "room_server/server_socket.cc",
+    "room_server/server_socket.h",
   ]
   deps = [
+    "//rtc_base:base64",
+    "//rtc_base:checks",
+    "//rtc_base:digest",
+    "//rtc_base:log_sinks",
+    "//rtc_base:logging",
     "//third_party/abseil-cpp/absl/flags:flag",
     "//third_party/abseil-cpp/absl/flags:parse",
     "//third_party/abseil-cpp/absl/flags:usage",
+    "//third_party/abseil-cpp/absl/strings",
   ]
 }
 

@@ -38,6 +38,18 @@ class ServerDataSocket : public ServerSocketBase {
     OPTIONS,
   };
   explicit ServerDataSocket(SocketFd socket) : ServerSocketBase(socket) {}
+  std::string path() const { return path_; }
+  std::string method_name() const {
+    switch (method_) {
+      case RequestMethod::GET: return "GET";
+      case RequestMethod::POST: return "POST";
+      case RequestMethod::OPTIONS: return "OPTIONS";
+      default: return "INVALID";
+    }
+  }
+  const std::string& raw_header() const { return header_; }
+  const std::string& body() const { return data_; }
+  size_t content_length() const { return content_length_; }
   bool headers_received() const { return method_ != RequestMethod::INVALID; }
   bool request_received() const {
     return headers_received() && data_.length() >= content_length_;
@@ -46,7 +58,19 @@ class ServerDataSocket : public ServerSocketBase {
     return method_ == RequestMethod::GET &&
            header_.find("Upgrade: websocket") != std::string::npos;
   }
+
+  bool Send(const std::string& data) const;
+  bool Send(const std::string& status,
+            bool connection_close,
+            const std::string& content_type,
+            const std::string& extra_headers,
+            const std::string& data) const;
+  bool SendWebSocketUpgradeResponse();
   bool onDataAvailable(bool& close_socket);
+  bool PathEquals(const char* path) const;
+  bool PathStartsWith(const char* prefix) const;
+
+ protected:
   bool ParseHeaders();
   bool ParseMethodAndPath(const char* begin, size_t len);
   bool ParseContentLengthAndType(const char* headers, size_t length);
