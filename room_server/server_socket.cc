@@ -49,6 +49,9 @@ bool ServerSocketBase::Create() {
 bool ServerDataSocket::Send(const std::string& data) const {
   int total_len = static_cast<int>(data.length());
   int sent = send(socket_, data.data(), static_cast<size_t>(total_len), 0);
+  RTC_LOG(LS_INFO) << "[send] fd=" << socket_ << " sent=" << sent
+                   << " of " << total_len
+                   << (sent == -1 ? absl::StrCat(" errno=", errno) : "");
   if (sent == -1) {
     RTC_LOG(LS_ERROR) << "[send] failed: errno=" << errno
                       << " (len=" << total_len << ")";
@@ -98,18 +101,29 @@ bool ServerDataSocket::SendWebSocketUpgradeResponse() {
   if (end == std::string::npos)
     return false;
   std::string key = header_.substr(pos, end - pos);
+  RTC_LOG(LS_INFO) << "[ws-upgrade] Extracted key: [" << key << "]"
+                   << " (len=" << key.size() << ")";
 
   // RFC 6455: SHA-1(key + GUID) → Base64
   static constexpr char kWebSocketGUID[] =
-      "258EAFA5-E914-47DA-95CA-5AB0DC85B11B";
+      "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   std::string source = key + kWebSocketGUID;
+  RTC_LOG(LS_INFO) << "[ws-upgrade] SHA-1 input: [" << source << "]"
+                   << " (len=" << source.size() << ")";
   uint8_t digest[20];
   size_t digest_len =
       webrtc::ComputeDigest(webrtc::DIGEST_SHA_1, source.data(), source.size(),
                             digest, sizeof(digest));
   RTC_DCHECK_EQ(digest_len, 20u);
+  // Log hex digest for debugging.
+  char hex[41];
+  for (size_t i = 0; i < 20; ++i)
+    std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
+  hex[40] = '\0';
+  RTC_LOG(LS_INFO) << "[ws-upgrade] SHA-1 hex: " << hex;
   std::string accept = webrtc::Base64Encode(
       absl::string_view(reinterpret_cast<const char*>(digest), digest_len));
+  RTC_LOG(LS_INFO) << "[ws-upgrade] Accept: [" << accept << "]";
 
   // 发送 101 响应
   std::string response =
@@ -118,7 +132,98 @@ bool ServerDataSocket::SendWebSocketUpgradeResponse() {
       "Connection: Upgrade\r\n"
       "Sec-WebSocket-Accept: " +
       accept + "\r\n\r\n";
-  return Send(response);
+  RTC_LOG(LS_INFO) << "[ws-upgrade] MARKER: about to send, response_size="
+                   << response.size();
+  bool ok = Send(response);
+  RTC_LOG(LS_INFO) << "[ws-upgrade] Send returned: " << (ok ? "true" : "false");
+  return ok;
+}
+
+bool ServerDataSocket::ReadWebSocketFrame(std::string& message, bool& closed) {
+  closed = false;
+  message.clear();
+
+  // Read available data into buffer.
+  char raw[4096];
+  int bytes = ::recv(socket_, raw, sizeof(raw), 0);
+  if (bytes <= 0) {
+    closed = true;
+    return false;
+  }
+  ws_buffer_.append(raw, bytes);
+
+  // Need at least 2 bytes for the frame header.
+  if (ws_buffer_.size() < 2)
+    return false;
+
+  const uint8_t* p =
+      reinterpret_cast<const uint8_t*>(ws_buffer_.data());
+  uint8_t opcode = p[0] & 0x0F;
+  bool masked = (p[1] & 0x80) != 0;
+  uint64_t payload_len = p[1] & 0x7F;
+  size_t header_size = 2;
+
+  if (payload_len == 126) {
+    if (ws_buffer_.size() < 4)
+      return false;
+    payload_len = (static_cast<uint64_t>(p[2]) << 8) | p[3];
+    header_size = 4;
+  } else if (payload_len == 127) {
+    if (ws_buffer_.size() < 10)
+      return false;
+    payload_len = 0;
+    for (int i = 0; i < 8; ++i)
+      payload_len = (payload_len << 8) | p[2 + i];
+    header_size = 10;
+  }
+
+  size_t mask_size = masked ? 4 : 0;
+  size_t total = header_size + mask_size + payload_len;
+  if (ws_buffer_.size() < total)
+    return false;  // Incomplete frame, wait for more data.
+
+  const uint8_t* mask_key =
+      masked ? p + header_size : nullptr;
+  const uint8_t* payload = p + header_size + mask_size;
+
+  if (opcode == 0x08) {
+    // Close frame.
+    closed = true;
+    ws_buffer_.erase(0, total);
+    return false;
+  }
+
+  // Decode payload (unmask if needed).
+  message.resize(payload_len);
+  for (size_t i = 0; i < payload_len; ++i) {
+    message[i] = static_cast<char>(
+        payload[i] ^ (masked ? mask_key[i % 4] : 0));
+  }
+
+  ws_buffer_.erase(0, total);
+  return opcode == 0x01;  // true only for text frames.
+}
+
+bool ServerDataSocket::SendWebSocketFrame(const std::string& message) const {
+  std::string frame;
+  // FIN=1, opcode=0x01 (text).
+  frame.push_back(static_cast<char>(0x81));
+
+  size_t len = message.size();
+  // Server frames are NOT masked (MASK=0).
+  if (len <= 125) {
+    frame.push_back(static_cast<char>(len));
+  } else if (len <= 0xFFFF) {
+    frame.push_back(static_cast<char>(126));
+    frame.push_back(static_cast<char>((len >> 8) & 0xFF));
+    frame.push_back(static_cast<char>(len & 0xFF));
+  } else {
+    frame.push_back(static_cast<char>(127));
+    for (int i = 7; i >= 0; --i)
+      frame.push_back(static_cast<char>((len >> (i * 8)) & 0xFF));
+  }
+  frame.append(message);
+  return Send(frame);
 }
 
 bool ServerDataSocket::onDataAvailable(bool& close_socket) {

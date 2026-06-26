@@ -66,6 +66,15 @@ class ServerDataSocket : public ServerSocketBase {
             const std::string& extra_headers,
             const std::string& data) const;
   bool SendWebSocketUpgradeResponse();
+
+  // WebSocket frame I/O (after upgrade).
+  // Returns true if a complete text frame was read into |message|.
+  // |closed| is set to true if a close frame was received or the
+  // connection was lost.
+  bool ReadWebSocketFrame(std::string& message, bool& closed);
+  // Send a text WebSocket frame.
+  bool SendWebSocketFrame(const std::string& message) const;
+
   bool onDataAvailable(bool& close_socket);
   bool PathEquals(const char* path) const;
   bool PathStartsWith(const char* prefix) const;
@@ -82,6 +91,8 @@ class ServerDataSocket : public ServerSocketBase {
   std::string path_{};
   size_t content_length_{};
   std::string content_type_{};
+  // Buffer for accumulating partial WebSocket frame data.
+  std::string ws_buffer_{};
 };
 
 class ServerListenerSocket : public ServerSocketBase {
