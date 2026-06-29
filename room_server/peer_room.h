@@ -3,6 +3,7 @@
 
 #include <memory>
 #include <string>
+#include <vector>
 class ServerDataSocket;
 
 enum class MemberID {
@@ -60,10 +61,18 @@ class PeerRoom {
   // Get the other member (for message forwarding).
   RoomMember* GetOtherMember(int client_id) const;
 
+  // Queue a message for a client that hasn't joined yet.
+  void EnqueueMessage(int for_client_id, const std::string& message);
+  // Drain all queued messages for a client (returned as JSON array string).
+  std::string DrainMessages(int for_client_id);
+
  protected:
   std::string room_id_;
   std::unique_ptr<RoomMember> initiator_;
   std::unique_ptr<RoomMember> callee_;
   int member_count_ = 0;
+  // Pending messages for each client (delivered on /join).
+  std::vector<std::string> pending_for_initiator_;
+  std::vector<std::string> pending_for_callee_;
 };
 #endif

@@ -49,9 +49,6 @@ bool ServerSocketBase::Create() {
 bool ServerDataSocket::Send(const std::string& data) const {
   int total_len = static_cast<int>(data.length());
   int sent = send(socket_, data.data(), static_cast<size_t>(total_len), 0);
-  RTC_LOG(LS_INFO) << "[send] fd=" << socket_ << " sent=" << sent
-                   << " of " << total_len
-                   << (sent == -1 ? absl::StrCat(" errno=", errno) : "");
   if (sent == -1) {
     RTC_LOG(LS_ERROR) << "[send] failed: errno=" << errno
                       << " (len=" << total_len << ")";
@@ -101,29 +98,20 @@ bool ServerDataSocket::SendWebSocketUpgradeResponse() {
   if (end == std::string::npos)
     return false;
   std::string key = header_.substr(pos, end - pos);
-  RTC_LOG(LS_INFO) << "[ws-upgrade] Extracted key: [" << key << "]"
-                   << " (len=" << key.size() << ")";
 
   // RFC 6455: SHA-1(key + GUID) → Base64
   static constexpr char kWebSocketGUID[] =
       "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
   std::string source = key + kWebSocketGUID;
-  RTC_LOG(LS_INFO) << "[ws-upgrade] SHA-1 input: [" << source << "]"
-                   << " (len=" << source.size() << ")";
   uint8_t digest[20];
   size_t digest_len =
       webrtc::ComputeDigest(webrtc::DIGEST_SHA_1, source.data(), source.size(),
                             digest, sizeof(digest));
   RTC_DCHECK_EQ(digest_len, 20u);
-  // Log hex digest for debugging.
-  char hex[41];
-  for (size_t i = 0; i < 20; ++i)
-    std::snprintf(hex + i * 2, 3, "%02x", digest[i]);
-  hex[40] = '\0';
-  RTC_LOG(LS_INFO) << "[ws-upgrade] SHA-1 hex: " << hex;
   std::string accept = webrtc::Base64Encode(
       absl::string_view(reinterpret_cast<const char*>(digest), digest_len));
-  RTC_LOG(LS_INFO) << "[ws-upgrade] Accept: [" << accept << "]";
+  RTC_LOG(LS_INFO) << "[ws-upgrade] key=" << key
+                   << " accept=" << accept;
 
   // 发送 101 响应
   std::string response =
@@ -132,11 +120,7 @@ bool ServerDataSocket::SendWebSocketUpgradeResponse() {
       "Connection: Upgrade\r\n"
       "Sec-WebSocket-Accept: " +
       accept + "\r\n\r\n";
-  RTC_LOG(LS_INFO) << "[ws-upgrade] MARKER: about to send, response_size="
-                   << response.size();
-  bool ok = Send(response);
-  RTC_LOG(LS_INFO) << "[ws-upgrade] Send returned: " << (ok ? "true" : "false");
-  return ok;
+  return Send(response);
 }
 
 bool ServerDataSocket::ReadWebSocketFrame(std::string& message, bool& closed) {

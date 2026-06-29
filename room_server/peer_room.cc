@@ -63,3 +63,47 @@ RoomMember* PeerRoom::GetOtherMember(int client_id) const {
     return initiator_.get();
   return nullptr;
 }
+
+void PeerRoom::EnqueueMessage(int for_client_id, const std::string& message) {
+  if (for_client_id == static_cast<int>(MemberID::Initiator)) {
+    pending_for_initiator_.push_back(message);
+  } else if (for_client_id == static_cast<int>(MemberID::Callee)) {
+    pending_for_callee_.push_back(message);
+  }
+}
+
+std::string PeerRoom::DrainMessages(int for_client_id) {
+  std::vector<std::string>* queue = nullptr;
+  if (for_client_id == static_cast<int>(MemberID::Initiator)) {
+    queue = &pending_for_initiator_;
+  } else if (for_client_id == static_cast<int>(MemberID::Callee)) {
+    queue = &pending_for_callee_;
+  }
+  if (!queue || queue->empty())
+    return "[]";
+  std::string result = "[";
+  for (size_t i = 0; i < queue->size(); ++i) {
+    if (i > 0)
+      result += ",";
+    // Escape the message for JSON.
+    result += "\"";
+    for (char c : (*queue)[i]) {
+      if (c == '"')
+        result += "\\\"";
+      else if (c == '\\')
+        result += "\\\\";
+      else if (c == '\n')
+        result += "\\n";
+      else if (c == '\r')
+        result += "\\r";
+      else if (c == '\t')
+        result += "\\t";
+      else
+        result += c;
+    }
+    result += "\"";
+  }
+  result += "]";
+  queue->clear();
+  return result;
+}

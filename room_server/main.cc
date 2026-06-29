@@ -153,6 +153,15 @@ int main(int argc, char* argv[]) {
                  it != pending_connections.end()) {
         auto& client = it->second;
 
+        // Handle connection errors/hangups for any pending connection.
+        if (event_flags & (EPOLLERR | EPOLLHUP)) {
+          RTC_LOG(LS_INFO) << "[HTTP] Connection error/hangup: fd="
+                           << received_fd;
+          epoll_ctl(epoll_fd, EPOLL_CTL_DEL, received_fd, nullptr);
+          pending_connections.erase(it);
+          continue;
+        }
+
         // Already upgraded — incoming data is WebSocket frames.
         if (client->upgrade_received()) {
           std::string message;
@@ -189,119 +198,137 @@ int main(int argc, char* argv[]) {
         }
 
         bool socket_done = false;
-        if (client->onDataAvailable(socket_done) &&
-            client->request_received()) {
-          RTC_LOG(LS_INFO) << "[HTTP] Request received: "
-                           << client->method_name() << " " << client->path()
-                           << " (fd=" << received_fd
-                           << ", content_length=" << client->content_length()
-                           << ")";
-          RTC_LOG(LS_INFO) << "[HTTP] Headers:\n" << client->raw_header();
-          if (!client->body().empty()) {
-            RTC_LOG(LS_INFO)
-                << "[HTTP] Body (" << client->body().size() << " bytes):\n"
-                << client->body();
-          }
+        if (client->onDataAvailable(socket_done)) {
           if (client->upgrade_received()) {
+            // WebSocket upgrade — send 101 and keep connection alive.
             client->SendWebSocketUpgradeResponse();
-          } else if (client->PathStartsWith("/join")) {
-            // POST /join/{roomId}
-            std::string path = client->path();
-            std::string room_id;
-            size_t pos = path.find("/join/");
-            if (pos != std::string::npos) {
-              room_id = path.substr(pos + 6);
-              size_t q = room_id.find('?');
-              if (q != std::string::npos)
-                room_id = room_id.substr(0, q);
+            continue;
+          }
+          if (client->request_received()) {
+            RTC_LOG(LS_INFO) << "[HTTP] Request received: "
+                             << client->method_name() << " " << client->path()
+                             << " (fd=" << received_fd
+                             << ", content_length=" << client->content_length()
+                             << ")";
+            RTC_LOG(LS_INFO) << "[HTTP] Headers:\n" << client->raw_header();
+            if (!client->body().empty()) {
+              RTC_LOG(LS_INFO)
+                  << "[HTTP] Body (" << client->body().size() << " bytes):\n"
+                  << client->body();
             }
-            if (room_id.empty()) {
-              client->Send(
-                  "400 Bad Request", true, "application/json", "",
-                  "{\"result\":\"ERROR\",\"error\":\"Missing room id\"}");
-            } else {
-              auto [room_it, inserted] = room_map.try_emplace(room_id, room_id);
-              auto& room = room_it->second;
-              if (room.count() >= 2) {
+            if (client->PathStartsWith("/join")) {
+              // POST /join/{roomId}
+              std::string path = client->path();
+              std::string room_id;
+              size_t pos = path.find("/join/");
+              if (pos != std::string::npos) {
+                room_id = path.substr(pos + 6);
+                size_t q = room_id.find('?');
+                if (q != std::string::npos)
+                  room_id = room_id.substr(0, q);
+              }
+              if (room_id.empty()) {
                 client->Send(
                     "400 Bad Request", true, "application/json", "",
-                    "{\"result\":\"FULL\"}");
+                    "{\"result\":\"ERROR\",\"error\":\"Missing room id\"}");
               } else {
-                int client_id = room.HandleJoin();
-                bool is_initiator = (client_id == 1);
-                std::string host = GetLocalAddr(received_fd, port);
-                std::string json = absl::StrCat(
-                    "{\"result\":\"SUCCESS\","
-                    "\"params\":{"
-                    "\"is_initiator\":",
-                    is_initiator ? "true" : "false",
-                    ",\"room_id\":\"",
-                    room_id,
-                    "\","
-                    "\"client_id\":\"",
-                    absl::StrCat(client_id),
-                    "\","
-                    "\"messages\":[],"
-                    "\"wss_url\":\"ws://",
-                    host,
-                    "/ws\","
-                    "\"wss_post_url\":\"http://",
-                    host,
-                    "\""
-                    "}}");
-                RTC_LOG(LS_INFO) << "[join] room=" << room_id
-                                 << ", client=" << client_id
-                                 << ", initiator=" << is_initiator;
-                client->Send("200 OK", true, "application/json", "", json);
+                auto [room_it, inserted] = room_map.try_emplace(room_id, room_id);
+                auto& room = room_it->second;
+                if (room.count() >= 2) {
+                  client->Send(
+                      "400 Bad Request", true, "application/json", "",
+                      "{\"result\":\"FULL\"}");
+                } else {
+                  int client_id = room.HandleJoin();
+                  bool is_initiator = (client_id == 1);
+                  std::string host = GetLocalAddr(received_fd, port);
+                  std::string queued = room.DrainMessages(client_id);
+                  std::string json = absl::StrCat(
+                      "{\"result\":\"SUCCESS\","
+                      "\"params\":{"
+                      "\"is_initiator\":",
+                      is_initiator ? "true" : "false",
+                      ",\"room_id\":\"",
+                      room_id,
+                      "\","
+                      "\"client_id\":\"",
+                      absl::StrCat(client_id),
+                      "\","
+                      "\"messages\":",
+                      queued,
+                      ","
+                      "\"wss_url\":\"ws://",
+                      host,
+                      "/ws\","
+                      "\"wss_post_url\":\"http://",
+                      host,
+                      "\""
+                      "}}");
+                  RTC_LOG(LS_INFO) << "[join] room=" << room_id
+                                   << ", client=" << client_id
+                                   << ", initiator=" << is_initiator;
+                  client->Send("200 OK", true, "application/json", "", json);
+                }
               }
-            }
-            pending_connections.erase(it);
-          } else if (client->PathStartsWith("/message")) {
-            // POST /message/{roomId}/{clientId}
-            std::string path = client->path();
-            std::string room_id;
-            int sender_id = 0;
-            size_t pos = path.find("/message/");
-            if (pos != std::string::npos) {
-              std::string rest = path.substr(pos + 9);
-              size_t slash = rest.find('/');
-              if (slash != std::string::npos) {
-                room_id = rest.substr(0, slash);
-                sender_id = std::stoi(rest.substr(slash + 1));
+              pending_connections.erase(it);
+            } else if (client->PathStartsWith("/message")) {
+              // POST /message/{roomId}/{clientId}
+              std::string path = client->path();
+              std::string room_id;
+              int sender_id = 0;
+              size_t pos = path.find("/message/");
+              if (pos != std::string::npos) {
+                std::string rest = path.substr(pos + 9);
+                size_t slash = rest.find('/');
+                if (slash != std::string::npos) {
+                  room_id = rest.substr(0, slash);
+                  sender_id = std::stoi(rest.substr(slash + 1));
+                }
               }
-            }
-            auto room_it = room_map.find(room_id);
-            if (room_it != room_map.end()) {
-              RoomMember* other =
-                  room_it->second.GetOtherMember(sender_id);
-              if (other && other->socket()) {
-                other->SendMessage(client->body());
-                RTC_LOG(LS_INFO) << "[msg] Forwarded from client="
-                                 << sender_id << " room=" << room_id
-                                 << " (" << client->body().size()
-                                 << " bytes)";
-              } else {
-                RTC_LOG(LS_WARNING)
-                    << "[msg] No peer for client=" << sender_id
-                    << " in room=" << room_id;
+              auto room_it = room_map.find(room_id);
+              if (room_it != room_map.end()) {
+                RoomMember* other =
+                    room_it->second.GetOtherMember(sender_id);
+                if (other && other->socket()) {
+                  other->SendMessage(client->body());
+                  RTC_LOG(LS_INFO) << "[msg] Forwarded from client="
+                                   << sender_id << " room=" << room_id
+                                   << " (" << client->body().size()
+                                   << " bytes)";
+                } else {
+                  // Peer not connected yet — queue for delivery on /join.
+                  int peer_id = (sender_id == 1) ? 2 : 1;
+                  room_it->second.EnqueueMessage(peer_id, client->body());
+                  RTC_LOG(LS_INFO)
+                      << "[msg] Queued for client=" << peer_id
+                      << " in room=" << room_id
+                      << " (" << client->body().size() << " bytes)";
+                }
               }
+              client->Send("200 OK", true, "application/json", "",
+                           "{\"result\":\"SUCCESS\"}");
+              pending_connections.erase(it);
+            } else if (client->PathStartsWith("/leave")) {
+              // POST /leave/123456/78
+              client->Send("200 OK", true, "application/json", "",
+                           "{\"result\":\"SUCCESS\"}");
+              pending_connections.erase(it);
+            } else if (client->PathEquals("/params")) {
+              // GET /params — return empty ICE server config for LAN.
+              client->Send("200 OK", true, "application/json", "",
+                           "{\"ice_servers\":[]}");
+              pending_connections.erase(it);
+            } else {
+              RTC_LOG(LS_WARNING) << "Unknown request: " << client->path();
+              client->Send("404 Not Found", true, "text/plain", "", "");
+              pending_connections.erase(it);
             }
-            client->Send("200 OK", true, "text/plain", "", "");
-            pending_connections.erase(it);
-          } else if (client->PathStartsWith("/leave")) {
-            // POST /leave/123456/78
-            client->Send("200 OK", true, "text/plain", "", "");
-            pending_connections.erase(it);
-          } else if (client->PathEquals("/params")) {
-            // GET /params — return empty ICE server config for LAN.
-            client->Send("200 OK", true, "application/json", "",
-                         "{\"ice_servers\":[]}");
-            pending_connections.erase(it);
-          } else {
-            RTC_LOG(LS_WARNING) << "Unknown request: " << client->path();
-            client->Send("404 Not Found", true, "text/plain", "", "");
-            pending_connections.erase(it);
           }
+        } else if (socket_done) {
+          // Client disconnected before sending a complete request.
+          RTC_LOG(LS_INFO) << "[HTTP] Connection closed: fd=" << received_fd;
+          epoll_ctl(epoll_fd, EPOLL_CTL_DEL, received_fd, nullptr);
+          pending_connections.erase(it);
         }
       } else if (auto rm_it = room_members.find(received_fd);
                  rm_it != room_members.end()) {
@@ -346,6 +373,12 @@ int main(int argc, char* argv[]) {
           RTC_LOG(LS_INFO) << "[ws] Close frame from fd=" << received_fd;
           fds_to_remove.push_back(received_fd);
         }
+      } else {
+        // fd not tracked in any map — clean up to prevent repeated events.
+        RTC_LOG(LS_WARNING) << "[epoll] Untracked fd=" << received_fd
+                             << ", removing from epoll";
+        epoll_ctl(epoll_fd, EPOLL_CTL_DEL, received_fd, nullptr);
+        ::close(received_fd);
       }
     }
 
